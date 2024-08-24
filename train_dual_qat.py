@@ -57,7 +57,7 @@ from utils.qat_utils import calibrate_model
 from pytorch_quantization import quant_modules
 from pytorch_quantization import nn as quant_nn
 from models.yolo import Detect, DDetect, DualDetect, DualDDetect
-
+from termcolor import colored
 ########
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -165,7 +165,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
+    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'] * 0.1 , hyp['momentum'], hyp['weight_decay'])
+    print(colored(f"LR = {hyp['lr0'] * 0.1}", "red"))
 
     # Scheduler
     if opt.cos_lr:
