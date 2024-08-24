@@ -197,6 +197,9 @@ class DualDDetect(nn.Module):
 
     def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
         super().__init__()
+        
+        self.qat = False 
+        
         self.nc = nc  # number of classes
         self.nl = len(ch) // 2  # number of detection layers
         self.reg_max = 16
@@ -224,18 +227,32 @@ class DualDDetect(nn.Module):
         for i in range(self.nl):
             d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
             d2.append(torch.cat((self.cv4[i](x[self.nl+i]), self.cv5[i](x[self.nl+i])), 1))
-        if self.training:
-            return [d1, d2]
-        elif self.dynamic or self.shape != shape:
+            
+        if not self.qat:
+            if self.training:
+                return [d1, d2]
+            elif self.dynamic or self.shape != shape:
+                self.anchors, self.strides = (d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5))
+                self.shape = shape
+        
+            box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split((self.reg_max * 4, self.nc), 1)
+            dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+            box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split((self.reg_max * 4, self.nc), 1)
+            dbox2 = dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+            y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]    
+            return y if self.export else (y, [d1, d2])
+        
+        else:
             self.anchors, self.strides = (d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5))
             self.shape = shape
-
-        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split((self.reg_max * 4, self.nc), 1)
-        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
-        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split((self.reg_max * 4, self.nc), 1)
-        dbox2 = dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
-        y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]
-        return y if self.export else (y, [d1, d2])
+            box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split((self.reg_max * 4, self.nc), 1)
+            dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+            box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split((self.reg_max * 4, self.nc), 1)
+            dbox2 = dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+            y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]    
+            return y
+    
+    
         #y = torch.cat((dbox2, cls2.sigmoid()), 1)
         #return y if self.export else (y, d2)
         #y1 = torch.cat((dbox, cls.sigmoid()), 1)
