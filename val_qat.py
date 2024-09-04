@@ -24,7 +24,7 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
-
+from termcolor import colored
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
     gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
@@ -176,6 +176,8 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     
     ## QAT MODEL ##
+    
+
     from models.yolo import DetectionModel, DDetect
     model = DetectionModel(cfg='models/detect/gelan-c.yaml', ch=3, nc=10)
     ckpt = torch.load('runs/train/yolov9-c/weights/yolov9-c-converted.pt')
@@ -185,13 +187,16 @@ def run(
     model.model[-1].qat_export()
     for k, m in model.named_modules():
         if isinstance(m, DDetect):
-            m.qat = False
+            m.qat = True
             m.training = False
             m.inplace = False
             m.dynamic = False
             m.export = True
     
-    model.eval().cuda()
+    model = torch.jit.load('runs/train/yolov9-c/weights/yolov9-c-converted_qat_NVIDIA_GeForce_RTX_3090.torchscript')
+    
+    model.to(device).eval()
+    
     ################
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
@@ -206,13 +211,14 @@ def run(
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
-        with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+        # with dt[1]:
+        #     preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
 
-        # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+        # # Loss
+        # if compute_loss:
+        #     loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
+        preds = model(im)
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
