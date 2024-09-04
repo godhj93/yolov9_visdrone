@@ -82,7 +82,8 @@ class DDetect(nn.Module):
     shape = None
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
-
+    qat = False
+    
     def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
@@ -99,21 +100,48 @@ class DDetect(nn.Module):
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
+        '''QAT
+        input shape: torch.Size([1, 3, 384, 672])
+        x[0].shape: torch.Size([1, 144, 48, 84])
+        x[1].shape: torch.Size([1, 144, 24, 42])
+        x[2].shape: torch.Size([1, 144, 12, 21])
+        self.anchors.shape: torch.Size([2, 5292])
+        self.strides.shape: torch.Size([1, 5292])
+        '''
+        from utils.tal.anchor_generator import make_anchors_qat
+        self.anchors_qat = torch.empty(size=(2,5292))
+        self.strides_qat = torch.empty(size=(1,5292))
+        fake_feats = [torch.rand([1, 144, 48, 84]), torch.rand([1, 144, 24, 42]), torch.rand([1, 144, 12, 21])]
+        self.anchors_qat, self.strides_qat = (x.transpose(0,1) for x in make_anchors_qat(fake_feats, self.stride, grid_cell_offset=0.5))
+        self.anchors_qat = self.anchors_qat.cuda()
+        self.strides_qat = self.strides_qat.cuda()
+        
     def forward(self, x):
         shape = x[0].shape  # BCHW
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
-        if self.training:
-            return x
-        elif self.dynamic or self.shape != shape:
-            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
-            self.shape = shape
+            
+        if not self.qat:
+            if self.training:
+                return x
+            elif self.dynamic or self.shape != shape:
+                self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+                self.shape = shape
 
-        box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
-        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
-        y = torch.cat((dbox, cls.sigmoid()), 1)
-        return y if self.export else (y, x)
-
+            box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
+            dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+            y = torch.cat((dbox, cls.sigmoid()), 1)
+            return y if self.export else (y, x)
+        
+        else:
+            
+            box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
+            
+            dbox = dist2bbox(self.dfl(box), self.anchors_qat.unsqueeze(0), xywh=True, dim=1) * self.strides_qat
+            y = torch.cat((dbox, cls.sigmoid()), 1)
+            return y
+        
+          
     def bias_init(self):
         # Initialize Detect() biases, WARNING: requires stride availability
         m = self  # self.model[-1]  # Detect() module
@@ -243,6 +271,8 @@ class DualDDetect(nn.Module):
             return y if self.export else (y, [d1, d2])
         
         else:
+            
+
             self.anchors, self.strides = (d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5))
             self.shape = shape
             box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split((self.reg_max * 4, self.nc), 1)
@@ -813,10 +843,27 @@ if __name__ == '__main__':
     device = select_device(opt.device)
 
     # Create model
-    im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
+    ## QAT
+    import torch_tensorrt
+    from utils.qat_utils import calibrate_model
+    from pytorch_quantization import quant_modules
+    from pytorch_quantization import nn as quant_nn
+    from models.yolo import Detect, DDetect, DualDetect, DualDDetect
+    from termcolor import colored
+    quant_modules.initialize()
+    ## END QAT
+
+    im = torch.rand(1, 3, 384, 672).to(device)
     model = Model(opt.cfg).to(device)
     model.eval()
-
+    for k, m in model.named_modules():
+        if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect)):
+            m.qat = True
+            m.training = False
+            m.inplace = False
+            m.dynamic = False
+            m.export = True
+            
     # Options
     if opt.line_profile:  # profile layer by layer
         model(im, profile=True)
@@ -832,4 +879,6 @@ if __name__ == '__main__':
                 print(f'Error in {cfg}: {e}')
 
     else:  # report fused model summary
-        model.fuse()
+        # model.fuse()
+        
+        model(im, profile=False)
