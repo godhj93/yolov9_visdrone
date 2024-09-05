@@ -1,3 +1,138 @@
+
+# YOLOv9 Network Compression for VisDrone Dataset
+
+## Quantize and export the model to TensorRT (Torch-TensorRT)
+- To compile GELAN-C model using 'torch_tensorrt.compile()', the following steps are required:
+  - Pre memory allocation for the DDetect module not using torch.meshgrid function.
+  - For now, only fixed resolution is supported.
+    - We need to calculate featrue dimension for the DDetection layer
+        - It is implemented in class 'DetectionModel' in 'models/yolo.py' as follows:
+            ```python
+            im = torch.zeros(1, 3, 384, 672) # <- You need modify the values for your case.
+            print(colored(f"Input is {im.size()}, It is important for QAT export, normal training is not realted to this.", "red"))
+            m.qat_feat_dim = [torch.zeros_like(x) for x in forward(im)]
+            ```
+        - 'qat_feat_dim' is used in the 'DDetect' layer as follows:
+            ```python
+            self.anchors_qat, self.strides_qat = (x.transpose(0,1) for x in make_anchors(self.qat_feat_dim, self.stride, grid_cell_offset=0.5))
+            self.anchors_qat = self.anchors_qat.cuda()
+            self.strides_qat = self.strides_qat.cuda()
+            print(colored(f"DDetect QAT initialized", "green"))
+            ```
+
+    - The 'DFL' layer contains a point-wise convolution layer but not require gradient. So we can change this layer to numpy or python code not be detected in pytorch_quantization module for the calibration.
+        - It is implemented in the DFL class in 'models/common.py' as follows:
+            ```python
+            def update_forward_for_trt(self):
+                self.forward = self.trt_forward
+                print(colored("DFL forward updated!", 'red'))
+            ```
+
+    - With these modifications, we can compile the model using 'torch_tensorrt.compile()'
+        1. First, we need to load the pretrained model and update the dfl module for exporting.
+            ```python
+            if pretrained:
+                # with torch_distributed_zero_first(LOCAL_RANK):
+                    # weights = attempt_download(weights)  # download if not found locally
+                ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+                model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+                exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+                csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+                csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+                
+                ## QAT ##
+                modified_state_dict = {}
+                # print(csd)
+                for key, val in csd.items():
+                    # Remove 'module.' from the key names
+                    if key.startswith('module'):
+                        modified_state_dict[key[7:]] = val
+                    else:
+                        modified_state_dict[key] = val
+                
+                model.load_state_dict(modified_state_dict, strict=False)  # load
+                model.model[-1].dfl.update_forward_for_trt()
+                #########
+                # model.load_state_dict(csd, strict=False)  # load
+                LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+            ```
+        2. Then, calibrate the model as follows:
+            ```python
+            with torch.no_grad():
+                calibrate_model(
+                    model = model,
+                    model_name = 'qat_calib_file',
+                    data_loader = train_loader,
+                    num_calib_batch = batch_size // WORLD_SIZE * 2,
+                    calibrator = "max",
+                    hist_percentile=[99.9, 99.99, 99.999, 99.9999],
+                    out_dir = opt.save_dir,
+                )
+            ```
+        3. If you want to train the quantized network (QAT), use opt.qat when run the training script. This allows the model to be learned after the calbration.
+        **(NOTE: QAT is not stable now, so I recommend to use the calibration only.)**
+            ```python
+            if opt.qat:
+                model.qat = True
+            ```
+
+        4. After the calibration or QAT, update the DDetect layer for exporting the model as follows:
+            ```python
+             ## QAT ##
+            quant_nn.TensorQuantizer.use_fb_fake_quant = True
+
+            # Update model
+            model.model[-1].qat_export()
+            model.eval()
+            for k, m in model.named_modules():
+                if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect)):
+                    m.qat = True
+                    m.training = False
+                    m.inplace = False
+                    m.dynamic = False
+                    m.export = True
+            ```
+        5. Finally, compile the model using 'torch_tensorrt.compile() as follows:
+
+            ```python
+            with torch.no_grad():
+                # data = next(iter(train_loader))
+                # images, _, _, _ = data
+                # images = images.to('cuda', non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+                images = torch.rand((1, 3, 384, 672)).cuda()
+                print(colored(f"image shape: {images.shape}", 'red'))
+                time.sleep(5)
+                jit_model = torch.jit.trace(model, images, strict=False)
+                if opt.qat:
+                    torch.jit.save(jit_model, weights.replace('.pt', '_qat.jit'))
+                else:
+                    torch.jit.save(jit_model, weights.replace('.pt', '_ptq.jit'))
+            
+            # Compile the JIT model with TensorRT
+            if opt.qat:
+                jit_model = torch.jit.load(weights.replace('.pt', '_qat.jit'))
+            else:
+                jit_model = torch.jit.load(weights.replace('.pt', '_ptq.jit'))
+            B, C, H, W = images.shape
+            trt_mod = torch_tensorrt.compile(
+                    jit_model, 
+                    inputs=[torch.randn((1, C, H, W)).to('cuda')],
+                    enabled_precisions={torch.int8},  # Use int8 precision
+                    truncate_long_and_double=True,
+                    
+                )
+            
+            # Get GPU name
+            gpu_name = torch.cuda.get_device_name(0)
+            if opt.qat:
+                weights_path = weights.replace('.pt', f'_qat_{gpu_name}.torchscript').replace(' ', '_')
+            else:
+                weights_path = weights.replace('.pt', f'_ptq_{gpu_name}.torchscript').replace(' ', '_')
+                
+            torch.jit.save(trt_mod, weights_path)
+            print(colored(f"QAT model saved to {weights_path}", 'green'))
+            ```
+---
 # YOLOv9
 
 Implementation of paper - [YOLOv9: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
