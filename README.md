@@ -1,7 +1,7 @@
 
 # YOLOv9 Network Compression for VisDrone Dataset
 
-## Quantize and export the model to TensorRT (Torch-TensorRT)
+## Quantize and export the model to TensorRT (Torch-TensorRT: v1.4.0)
 - To compile GELAN-C model using 'torch_tensorrt.compile()', the following steps are required:
   - Pre memory allocation for the DDetect module not using torch.meshgrid function.
   - For now, only fixed resolution is supported.

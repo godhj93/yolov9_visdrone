@@ -145,10 +145,7 @@ class DDetect(nn.Module):
         else:
             self.shape = shape
             box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
-            
-            # return x, self.dfl(box)
             dbox = dist2bbox(self.dfl(box), self.anchors_qat.unsqueeze(0), xywh=True, dim=1) * self.strides_qat
-            # self.temp_dbox = dbox
             y = torch.cat((dbox, cls.sigmoid()), 1)
             return y
         
