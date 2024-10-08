@@ -30,8 +30,7 @@ from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suff
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
 
-import torch_tensorrt
-from termcolor import colored
+
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
     # Pad to 'same' shape outputs
     if d > 1:
@@ -243,22 +242,6 @@ class DFL(nn.Module):
         b, c, a = x.shape  # batch, channels, anchors
         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
-    
-    def update_forward_for_trt(self):
-        
-        self.forward = self.trt_forward
-        print(colored("DFL forward updated!", 'red'))
-        
-    def trt_forward(self, x):
-        b, c, a = x.shape  # batch, channels, anchors
-        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # (b, c1, 4, a)로 변환
-        x = x.softmax(1)  # 채널 방향으로 소프트맥스 적용
-        
-        # 0부터 c1-1까지의 가중치 적용을 대체
-        weights = torch.arange(self.c1, dtype=torch.float, device=x.device).view(1, self.c1, 1, 1)
-        output = (x * weights).sum(1)  # 가중치를 곱하고 합산
-        
-        return output.view(b, 4, a)  # (b, 4, a) 형태로 반환
 
 
 class BottleneckBase(nn.Module):

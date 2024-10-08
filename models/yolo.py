@@ -100,7 +100,6 @@ class DDetect(nn.Module):
             nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
-    
     def qat_export(self):
         
         '''QAT
@@ -130,6 +129,7 @@ class DDetect(nn.Module):
         shape = x[0].shape  # BCHW
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            
         if not self.qat:
             if self.training:
                 return x
@@ -137,7 +137,7 @@ class DDetect(nn.Module):
                 self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
                 self.shape = shape
             box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
-            # return x, self.dfl(box)
+            self.temp_box, self.temp_cls = box, cls
             dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
             y = torch.cat((dbox, cls.sigmoid()), 1)
             return y if self.export else (y, x)
@@ -145,9 +145,11 @@ class DDetect(nn.Module):
         else:
             self.shape = shape
             box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
+            self.temp_box, self.temp_cls = box, cls
             dbox = dist2bbox(self.dfl(box), self.anchors_qat.unsqueeze(0), xywh=True, dim=1) * self.strides_qat
             y = torch.cat((dbox, cls.sigmoid()), 1)
             return y
+        
         
           
     def bias_init(self):
@@ -665,9 +667,8 @@ class DetectionModel(BaseModel):
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             
             ## QAT
-            im = torch.zeros(1, 3, 384, 672)
-            print(colored(f"Input is {im.size()}, It is important for QAT export, normal training is not realted to this.", "red"))
-            m.qat_feat_dim = [torch.zeros_like(x) for x in forward(im)]
+            print(colored("Input is (1, 3, 640, 640), It is important for QAT export, normal training is not realted to this.", "red"))
+            m.qat_feat_dim = [torch.zeros_like(x) for x in forward(torch.zeros(1, 3, 640, 640))]
             ######
             
             # check_anchor_order(m)
@@ -868,18 +869,14 @@ if __name__ == '__main__':
     import copy
     quant_modules.initialize()
     ## END QAT
-    model = DetectionModel(cfg='models/detect/gelan-c.yaml', ch=3, nc=10)
-    model_q = DetectionModel(cfg='models/detect/gelan-c.yaml', ch=3, nc=10)
-    ckpt = torch.load('runs/train/yolov9-c/weights/yolov9-c-converted.pt')
-    model.load_state_dict(ckpt['model'].state_dict())
-    model_q.load_state_dict(ckpt['model'].state_dict())
-    
-    model.eval().cuda()
-    model_q.eval().cuda()
-    model_q.model[-1].qat_export()
+
     # im = torch.rand(1, 3, 384, 672).to(device)
-    im = torch.rand(1, 3, 384, 672).to(device)
-    
+    im = torch.rand(1, 3, 640, 640).to(device)
+    model = Model(opt.cfg).to(device)
+    model_q = copy.deepcopy(model)
+    model_q.model[-1].qat_export()
+    model.eval()
+    model_q.eval()
     for k, m in model.named_modules():
         if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect)):
             m.qat = False
@@ -911,21 +908,17 @@ if __name__ == '__main__':
 
     else:  # report fused model summary
         # model.fuse()
-        
-        jit_model = torch.jit.load('/root/yolov9_visdrone/runs/train/yolov9-c/weights/yolov9-c-converted_qat.jit')
-        
         print("#################################")
-        y, y2 = model(im, profile=False)
-        y_q, y_q2 = model_q(im, profile=False)
-        y_jit, y_jit2 = jit_model(im)
+        y = model(im, profile=False)
+        y_q = model_q(im, profile=False)
         print("#################################")
 
-        print(y_jit, y_jit2)
+        print((model.model[-1].stride == model_q.model[-1].stride).all())
+        print((model.model[-1].shape == model_q.model[-1].shape))
+        print((model.model[-1].temp_box == model_q.model[-1].temp_box).all())
+        print((model.model[-1].temp_cls == model_q.model[-1].temp_cls).all())
+        print((model.model[-1].strides == model_q.model[-1].strides_qat).all())
         
-        
-        import numpy as np
-        
-        
-        
-        
-        
+        print((y == y_q).all())
+        # print(model_q.model[-1].anchors_qat)
+        # print(y_q[0,:])
