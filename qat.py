@@ -50,12 +50,59 @@ GIT_INFO = None
 ## QAT ##
 
 import torch_tensorrt
-from utils.qat_utils import calibrate_model
+# from utils.qat_utils import calibrate_model
 from pytorch_quantization import quant_modules
 from pytorch_quantization import nn as quant_nn
 from models.yolo import Detect, DDetect, DualDetect, DualDDetect
 from termcolor import colored
-########
+from models.common import DFL
+
+# 모델 탐색 및 양자화 적용 함수
+def apply_quantization(model):
+    
+    for name, module in model.named_children():
+        if isinstance(module, nn.Conv2d):
+            # Conv2d를 QuantConv2d로 변경
+            quantized_layer = quant_nn.QuantConv2d(in_channels=module.in_channels,
+                                                   out_channels=module.out_channels,
+                                                   kernel_size=module.kernel_size,
+                                                   stride=module.stride,
+                                                   padding=module.padding,
+                                                   bias = True if module.bias is not None else False)
+            setattr(model, name, quantized_layer)
+            # print(f"Quantizing {name}")
+            
+        elif isinstance(module, DDetect):
+            
+            for n, m in module.named_children():
+                
+                if isinstance(m, nn.ModuleList):
+                    
+                    for _, mm in m.named_children():
+                        '''
+                        이 부분이 QAT 망가뜨리게 하는 부분으로 Bias가 학습 안되게 고정시킬 필요가 있음
+                        '''
+                        print(colored(f" {mm[2].bias.requires_grad}", "red"))
+                        mm[2].bias.requires_grad=False
+                        print(colored(f" {mm[2].bias.requires_grad}", "blue"))
+                    
+                    apply_quantization(mm)
+                
+                # elif isinstance(m, DFL):
+                    # print('dfl')
+                    # apply_quantization(m)
+                    
+                else:
+                    # print('dfl')
+                    apply_quantization(m)
+                    
+        elif isinstance(module, nn.Sequential) or isinstance(module, nn.ModuleList):
+            # Sequential 또는 ModuleList 같은 모듈 내부 탐색
+            apply_quantization(module)  # 재귀 호출
+        else:
+            # 다른 모듈에 대해서는 재귀적으로 탐색
+            apply_quantization(module)
+            
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -109,19 +156,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     is_coco = isinstance(val_path, str) and val_path.endswith('val2017.txt')  # COCO dataset
 
     # Model
-    quant_modules.initialize()
-    
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
-        # with torch_distributed_zero_first(LOCAL_RANK):
-            # weights = attempt_download(weights)  # download if not found locally
+        with torch_distributed_zero_first(LOCAL_RANK):
+            weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        apply_quantization(model)
+        model = model.to(device)
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        
         ## QAT ##
         modified_state_dict = {}
         # print(csd)
@@ -131,14 +177,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 modified_state_dict[key[7:]] = val
             else:
                 modified_state_dict[key] = val
-        
         model.load_state_dict(modified_state_dict, strict=False)  # load
-        model.model[-1].dfl.update_forward_for_trt()
-        #########
-        # model.load_state_dict(csd, strict=False)  # load
+        # model.load_state_dict(modified_state_dict, strict=True)  # load
+        
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        
+    # print(model)
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -175,6 +221,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
 
+    lf = lambda x: hyp['lrf']  # fixed lr
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # from utils.plots import plot_lr_scheduler; plot_lr_scheduler(optimizer, scheduler, epochs)
 
@@ -241,20 +288,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             model.half().float()  # pre-reduce anchor precision
 
         callbacks.run('on_pretrain_routine_end', labels, names)
-   
-    ## QAT ##
-    
-    with torch.no_grad():
-        calibrate_model(
-            model = model,
-            model_name = 'qat_calib_file',
-            data_loader = train_loader,
-            num_calib_batch = batch_size // WORLD_SIZE * 2,
-            calibrator = "max",
-            hist_percentile=[99.9, 99.99, 99.999, 99.9999],
-            out_dir = opt.save_dir,
-        )
-    #########
+
     # DDP mode
     if cuda and RANK != -1:
         model = smart_DDP(model)
@@ -287,156 +321,155 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        callbacks.run('on_train_epoch_start')
+        model.train()
+
+        # Update image weights (optional, single-GPU only)
+        if opt.image_weights:
+            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+            iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+            dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
+        if epoch == (epochs - opt.close_mosaic):
+            LOGGER.info("Closing dataloader mosaic")
+            dataset.mosaic = False
+
+        # Update mosaic border (optional)
+        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
+        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
+
+        mloss = torch.zeros(3, device=device)  # mean losses
+        if RANK != -1:
+            train_loader.sampler.set_epoch(epoch)
+        pbar = enumerate(train_loader)
+        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        if RANK in {-1, 0}:
+            pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
+        optimizer.zero_grad()
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            callbacks.run('on_train_batch_start')
+            ni = i + nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            # # Warmup
+            # if ni <= nw:
+            #     xi = [0, nw]  # x interp
+            #     # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+            #     accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+            #     for j, x in enumerate(optimizer.param_groups):
+            #         # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+            #         x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
+            #         if 'momentum' in x:
+            #             x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+
+            # Multi-scale
+            if opt.multi_scale:
+                sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
+                sf = sz / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+
+            # Forward
+            with torch.cuda.amp.autocast(amp):
+                pred = model(imgs)  # forward
+                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                if RANK != -1:
+                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                if opt.quad:
+                    loss *= 4.
+
+            # Backward
+            scaler.scale(loss).backward()
+
+            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+            if ni - last_opt_step >= accumulate:
+                scaler.unscale_(optimizer)  # unscale gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                scaler.step(optimizer)  # optimizer.step
+                scaler.update()
+                optimizer.zero_grad()
+                if ema:
+                    ema.update(model)
+                last_opt_step = ni
+
+            # Log
+            if RANK in {-1, 0}:
+                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+                if callbacks.stop_training:
+                    return
+                
+            break
+            # end batch ------------------------------------------------------------------------------------------------
+
+        # Scheduler
+        lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
+        scheduler.step()
+
+        if RANK in {-1, 0}:
+            # mAP
+            callbacks.run('on_train_epoch_end', epoch=epoch)
+            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
+            if not noval or final_epoch:  # Calculate mAP
+                results, maps, _ = validate.run(data_dict,
+                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                imgsz=imgsz,
+                                                half=amp,
+                                                model=ema.ema,
+                                                single_cls=single_cls,
+                                                dataloader=val_loader,
+                                                save_dir=save_dir,
+                                                plots=False,
+                                                callbacks=callbacks,
+                                                compute_loss=compute_loss)
+
+            # Update best mAP
+            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            stop = stopper(epoch=epoch, fitness=fi)  # early stop check
+            if fi > best_fitness:
+                best_fitness = fi
+            log_vals = list(mloss) + list(results) + lr
+            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+
+            # Save model
+            if (not nosave) or (final_epoch and not evolve):  # if save
+                ckpt = {
+                    'epoch': epoch,
+                    'best_fitness': best_fitness,
+                    'model': deepcopy(de_parallel(model)).half(),
+                    'ema': deepcopy(ema.ema).half(),
+                    'updates': ema.updates,
+                    'optimizer': optimizer.state_dict(),
+                    'opt': vars(opt),
+                    'git': GIT_INFO,  # {remote, branch, commit} if a git repo
+                    'date': datetime.now().isoformat()}
+
+                # Save last, best and delete
+                torch.save(ckpt, last)
+                if best_fitness == fi:
+                    torch.save(ckpt, best)
+                if opt.save_period > 0 and epoch % opt.save_period == 0:
+                    torch.save(ckpt, w / f'epoch{epoch}.pt')
+                del ckpt
+                callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+
+        # EarlyStopping
+        if RANK != -1:  # if DDP training
+            broadcast_list = [stop if RANK == 0 else None]
+            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+            if RANK != 0:
+                stop = broadcast_list[0]
+        if stop:
+            break  # must break all DDP ranks
+
+        # end epoch ----------------------------------------------------------------------------------------------------
+    # end training -----------------------------------------------------------------------------------------------------
     
-    if opt.qat:
-        for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
-            callbacks.run('on_train_epoch_start')
-            model.train()
-
-            # Update image weights (optional, single-GPU only)
-            if opt.image_weights:
-                cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-                iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-                dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-            if epoch == (epochs - opt.close_mosaic):
-                LOGGER.info("Closing dataloader mosaic")
-                dataset.mosaic = False
-
-            # Update mosaic border (optional)
-            # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-            # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
-            mloss = torch.zeros(3, device=device)  # mean losses
-            if RANK != -1:
-                train_loader.sampler.set_epoch(epoch)
-            pbar = enumerate(train_loader)
-            LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
-            if RANK in {-1, 0}:
-                pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
-            optimizer.zero_grad()
-            for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-                callbacks.run('on_train_batch_start')
-                ni = i + nb * epoch  # number integrated batches (since train start)
-                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
-                # Warmup
-                if ni <= nw:
-                    xi = [0, nw]  # x interp
-                    # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                    accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
-                    for j, x in enumerate(optimizer.param_groups):
-                        # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                        x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
-                        if 'momentum' in x:
-                            x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
-
-                # Multi-scale
-                if opt.multi_scale:
-                    sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
-                    sf = sz / max(imgs.shape[2:])  # scale factor
-                    if sf != 1:
-                        ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                        imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-
-                # Forward
-                with torch.cuda.amp.autocast(amp):
-                    pred = model(imgs)  # forward
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                    if RANK != -1:
-                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                    if opt.quad:
-                        loss *= 4.
-
-                # Backward
-                scaler.scale(loss).backward()
-
-                # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-                if ni - last_opt_step >= accumulate:
-                    scaler.unscale_(optimizer)  # unscale gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                    scaler.step(optimizer)  # optimizer.step
-                    scaler.update()
-                    optimizer.zero_grad()
-                    if ema:
-                        ema.update(model)
-                    last_opt_step = ni
-
-                # Log
-                if RANK in {-1, 0}:
-                    mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                    mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                    pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
-                                        (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                    callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
-                    if callbacks.stop_training:
-                        return
-                # end batch ------------------------------------------------------------------------------------------------
-
-            # Scheduler
-            lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
-            # scheduler.step()
-            print(colored("Scheduler Disabled", 'red'))
-
-            if RANK in {-1, 0}:
-                # mAP
-                callbacks.run('on_train_epoch_end', epoch=epoch)
-                ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
-                final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-                if not noval or final_epoch:  # Calculate mAP
-                    results, maps, _ = validate.run(data_dict,
-                                                    batch_size=batch_size // WORLD_SIZE * 2,
-                                                    imgsz=imgsz,
-                                                    half=amp,
-                                                    model=ema.ema,
-                                                    single_cls=single_cls,
-                                                    dataloader=val_loader,
-                                                    save_dir=save_dir,
-                                                    plots=False,
-                                                    callbacks=callbacks,
-                                                    compute_loss=compute_loss)
-
-                # Update best mAP
-                fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-                stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-                if fi > best_fitness:
-                    best_fitness = fi
-                log_vals = list(mloss) + list(results) + lr
-                callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
-
-                # Save model
-                if (not nosave) or (final_epoch and not evolve):  # if save
-                    ckpt = {
-                        'epoch': epoch,
-                        'best_fitness': best_fitness,
-                        'model': deepcopy(de_parallel(model)).half(),
-                        'ema': deepcopy(ema.ema).half(),
-                        'updates': ema.updates,
-                        'optimizer': optimizer.state_dict(),
-                        'opt': vars(opt),
-                        'git': GIT_INFO,  # {remote, branch, commit} if a git repo
-                        'date': datetime.now().isoformat()}
-
-                    # Save last, best and delete
-                    torch.save(ckpt, last)
-                    if best_fitness == fi:
-                        torch.save(ckpt, best)
-                    if opt.save_period > 0 and epoch % opt.save_period == 0:
-                        torch.save(ckpt, w / f'epoch{epoch}.pt')
-                    del ckpt
-                    callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
-
-            # # EarlyStopping
-            # if RANK != -1:  # if DDP training
-            #     broadcast_list = [stop if RANK == 0 else None]
-            #     dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-            #     if RANK != 0:
-            #         stop = broadcast_list[0]
-            # if stop:
-            #     break  # must break all DDP ranks
-            # end epoch ----------------------------------------------------------------------------------------------------
-        # end training -----------------------------------------------------------------------------------------------------
-    else:
-        print(colored("QAT Disabled", 'red'))
     ## QAT ##
     quant_nn.TensorQuantizer.use_fb_fake_quant = True
 
@@ -455,7 +488,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # data = next(iter(train_loader))
         # images, _, _, _ = data
         # images = images.to('cuda', non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-        images = torch.rand((1, 3, 384, 672)).cuda()
+        # images = torch.rand((1, 3, 384, 672)).cuda()
+        images = torch.rand((1, 3, 640, 640)).cuda()
         print(colored(f"image shape: {images.shape}", 'red'))
         time.sleep(5)
         jit_model = torch.jit.trace(model, images, strict=False)
@@ -488,36 +522,36 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     torch.jit.save(trt_mod, weights_path)
     print(colored(f"QAT model saved to {weights_path}", 'green'))
     
-    # if RANK in {-1, 0}:
-    #     LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
-    #     for f in last, best:
-    #         if f.exists():
-    #             if f is last:
-    #                 strip_optimizer(f, last_striped)  # strip optimizers
-    #             else:
-    #                 strip_optimizer(f, best_striped)  # strip optimizers
-    #             if f is best:
-    #                 LOGGER.info(f'\nValidating {f}...')
-    #                 results, _, _ = validate.run(
-    #                     data_dict,
-    #                     batch_size=batch_size // WORLD_SIZE * 2,
-    #                     imgsz=imgsz,
-    #                     model=attempt_load(f, device).half(),
-    #                     single_cls=single_cls,
-    #                     dataloader=val_loader,
-    #                     save_dir=save_dir,
-    #                     save_json=is_coco,
-    #                     verbose=True,
-    #                     plots=plots,
-    #                     callbacks=callbacks,
-    #                     compute_loss=compute_loss)  # val best model with plots
-    #                 if is_coco:
-    #                     callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+    
+    if RANK in {-1, 0}:
+        LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+        for f in last, best:
+            if f.exists():
+                if f is last:
+                    strip_optimizer(f, last_striped)  # strip optimizers
+                else:
+                    strip_optimizer(f, best_striped)  # strip optimizers
+                if f is best:
+                    LOGGER.info(f'\nValidating {f}...')
+                    results, _, _ = validate.run(
+                        data_dict,
+                        batch_size=batch_size // WORLD_SIZE * 2,
+                        imgsz=imgsz,
+                        model=attempt_load(f, device).half(),
+                        single_cls=single_cls,
+                        dataloader=val_loader,
+                        save_dir=save_dir,
+                        save_json=is_coco,
+                        verbose=True,
+                        plots=plots,
+                        callbacks=callbacks,
+                        compute_loss=compute_loss)  # val best model with plots
+                    if is_coco:
+                        callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
-    #     callbacks.run('on_train_end', last, best, epoch, results)
+        callbacks.run('on_train_end', last, best, epoch, results)
 
     torch.cuda.empty_cache()
-    del model
     return results
 
 
@@ -563,7 +597,6 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
     parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
-    parser.add_argument('--qat', action='store_true', help='Quantization Aware Training')
 
     # Logger arguments
     parser.add_argument('--entity', default=None, help='Entity')
@@ -571,6 +604,7 @@ def parse_opt(known=False):
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='Version of dataset artifact to use')
 
+    parser.add_argument('--qat', action='store_true', help='Quantization Aware Training')
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 

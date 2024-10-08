@@ -136,13 +136,6 @@ def run(
 
     # Configure
     model.eval()
-    
-    ## QAT ##
-    from models.yolo import Detect, DDetect, DualDetect, DualDDetect
-    for k, m in model.named_modules():
-        if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect)):
-            m.qat = False
-    ########
     cuda = device.type != 'cpu'
     #is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'val2017.txt')  # COCO dataset
