@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-from termcolor import colored
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLO root directory
@@ -25,7 +24,8 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
-
+from termcolor import colored
+import torch_tensorrt
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
     gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
@@ -96,7 +96,7 @@ def run(
         project=ROOT / 'runs/val',  # save to project/name
         name='exp',  # save to project/name
         exist_ok=False,  # existing project/name ok, do not increment
-        half=False,  # use FP16 half-precision inference
+        half=True,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         min_items=0,  # Experimental
         model=None,
@@ -105,7 +105,6 @@ def run(
         plots=True,
         callbacks=Callbacks(),
         compute_loss=None,
-        decomposed = False,
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -113,10 +112,7 @@ def run(
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
         half &= device.type != 'cpu'  # half precision only supported on CUDA
         model.half() if half else model.float()
-    
-   
     else:  # called directly
-        
         device = select_device(device, batch_size=batch_size)
 
         # Directories
@@ -124,12 +120,9 @@ def run(
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
         # Load model
-        
         model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
         stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
         imgsz = check_img_size(imgsz, s=stride)  # check image size
-        # print(stride, imgsz) -> 32, 640
-        
         half = model.fp16  # FP16 supported on limited backends with CUDA
         if engine:
             batch_size = model.batch_size
@@ -137,29 +130,11 @@ def run(
             device = model.device
             if not (pt or jit):
                 batch_size = 1  # export.py models default to batch-size 1
-                LOGGER.info(f'Forcing --batch-size 1 square inference (1, 3, {imgsz}, {imgsz}) for non-PyTorch models')
+                LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
 
         # Data
         data = check_dataset(data)  # check
 
-    if opt.decomposed:
-        
-        # Directories
-        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-        
-        # Load model
-        # model = torch.load(opt.weights[0])#['model']
-        model = torch.load('runs/train/gelan-c58/weights/best.pt')['ema']
-        # model = torch.load('runs/train/gelan-c58/weights/best.pt')['model']
-        model.to(device).eval()
-        
-        if half:
-            model.half()
-        print(colored(f"Loaded decomposed model from {opt.weights}", 'green'))
-        print(colored(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}", 'green'))
-        
-        
     # Configure
     model.eval()
     cuda = device.type != 'cpu'
@@ -172,17 +147,15 @@ def run(
     # Dataloader
     if not training:
         if pt and not single_cls:  # check --weights are trained on --data
-            if not opt.decomposed:
-                ncm = model.model.nc
-                assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
-                                f'classes). Pass correct combination of --weights and --data that are trained together.'
-                                
-                model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-                
-            else:
-                ncm = 10 # Visdrone dataset
+            ncm = model.model.nc
+            assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
+                              f'classes). Pass correct combination of --weights and --data that are trained together.'
+        # model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         
-        pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
+        for _ in range(10): # warmup
+            model(torch.randn(1, 3, imgsz, imgsz).to(device).float())
+        # pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
+        pad, rect = 0.5, True # Non-square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
                                        imgsz,
@@ -206,9 +179,31 @@ def run(
     dt = Profile(), Profile(), Profile()  # profiling times
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
-    callbacks.run('on_val_start')
     
-   
+    ## QAT MODEL ##
+    
+
+    from models.yolo import DetectionModel, DDetect
+    model = DetectionModel(cfg='models/detect/gelan-c.yaml', ch=3, nc=10)
+    ckpt = torch.load('runs/train/yolov9-c/weights/yolov9-c-converted.pt')
+    print(ckpt.keys())
+    model.load_state_dict(ckpt['model'].state_dict())
+    # raise ValueError()
+    model.model[-1].qat_export()
+    for k, m in model.named_modules():
+        if isinstance(m, DDetect):
+            m.qat = True
+            m.training = False
+            m.inplace = False
+            m.dynamic = False
+            m.export = True
+    
+    # model = torch.jit.load(opt.weights)
+    model = torch.jit.load('runs/train/yolov9-c/weights/yolov9-c-converted_qat_NVIDIA_GeForce_RTX_4090.torchscript')
+    model.to(device).eval()
+    
+    ################
+    callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
@@ -216,18 +211,20 @@ def run(
             if cuda:
                 im = im.to(device, non_blocking=True)
                 targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
+            # im = im.half() if half else im.float()  # uint8 to fp16/32
+            im = im.float()
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
-        with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+        # with dt[1]:
+        #     preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
 
-        # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+        # # Loss
+        # if compute_loss:
+        #     loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
+        preds = model(im)
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
@@ -307,7 +304,9 @@ def run(
     # Print speeds
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     if not training:
-        shape = (batch_size, 3, imgsz, imgsz)
+        # shape = (batch_size, 3, imgsz, imgsz)
+        shape = im.shape
+        # shape = (batch_size, 3, imgsz_h, imgsz_w)
         LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
 
     # Plots
@@ -377,7 +376,6 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
-    parser.add_argument('--decomposed', action='store_true', help='use decomposed model')
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
