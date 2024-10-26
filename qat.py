@@ -409,7 +409,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if callbacks.stop_training:
                     return
                 
-            break
+            # break
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
