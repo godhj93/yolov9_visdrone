@@ -10,6 +10,6 @@ python qat.py \
 --min-items 0 \
 --epochs 1 \
 --close-mosaic 15 \
---weights gelanc-decomposed/weights/best.pt \
+--weights runs/train/gelanc-decomposed/weights/best.pt \
 --qat \
 --decomposed
