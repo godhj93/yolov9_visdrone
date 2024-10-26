@@ -1,1 +1,15 @@
-python qat.py --workers 8 --device 0 --batch 8 --data data/visdrone.yaml --img 640 --cfg models/detect/gelan-c.yaml --weights '' --name gelan-c --hyp hyp.scratch-qat.yaml --min-items 0 --epochs 1 --close-mosaic 15 --weights runs/train/yolov9-c/weights/yolov9-c-converted.pt --qat
+python qat.py \
+--workers 8 \
+--device 0 \
+--batch 8 \
+--data data/visdrone.yaml \
+--img 640 \
+--cfg models/detect/gelan-c.yaml \
+--name gelan-c \
+--hyp hyp.scratch-qat.yaml \
+--min-items 0 \
+--epochs 1 \
+--close-mosaic 15 \
+--weights gelanc-decomposed/weights/best.pt \
+--qat \
+--decomposed

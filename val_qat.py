@@ -154,8 +154,8 @@ def run(
         
         for _ in range(10): # warmup
             model(torch.randn(1, 3, imgsz, imgsz).to(device).float())
-        # pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
-        pad, rect = 0.5, True # Non-square inference for benchmarks
+        pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
+        # pad, rect = 0.5, True # Non-square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
                                        imgsz,
@@ -199,7 +199,8 @@ def run(
             m.export = True
     
     # model = torch.jit.load(opt.weights)
-    model = torch.jit.load('runs/train/yolov9-c/weights/yolov9-c-converted_qat_NVIDIA_GeForce_RTX_4090.torchscript')
+    # model = torch.jit.load('runs/train/yolov9-c/weights/yolov9-c-converted_qat_NVIDIA_GeForce_RTX_4090.torchscript')
+    model = torch.jit.load('runs/train/gelanc-decomposed/weights/best_qat_NVIDIA_GeForce_RTX_4090.torchscript')
     model.to(device).eval()
     
     ################

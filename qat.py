@@ -82,9 +82,9 @@ def apply_quantization(model):
                         '''
                         이 부분이 QAT 망가뜨리게 하는 부분으로 Bias가 학습 안되게 고정시킬 필요가 있음
                         '''
-                        print(colored(f" {mm[2].bias.requires_grad}", "red"))
-                        mm[2].bias.requires_grad=False
-                        print(colored(f" {mm[2].bias.requires_grad}", "blue"))
+                        # print(colored(f" {mm[2].bias.requires_grad}", "red"))
+                        mm[2].bias.requires_grad = False
+                        print(colored(f" {mm[2].__class__.__name__} bias requires_grad: {mm[2].bias.requires_grad}", "red"))
                     
                     apply_quantization(mm)
                 
@@ -162,7 +162,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        if opt.decomposed:
+            model = torch.load(weights, map_location='cpu')['ema'].to(device)
+            print(colored(f"Decomposed model loaded from {weights}", 'green'))
+        else:
+            
+            model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+            
         apply_quantization(model)
         model = model.to(device)
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
@@ -597,7 +603,7 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
     parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
-
+    parser.add_argument('--decomposed', action = 'store_true', help='Decomposed model')
     # Logger arguments
     parser.add_argument('--entity', default=None, help='Entity')
     parser.add_argument('--upload_dataset', nargs='?', const=True, default=False, help='Upload data, "val" option')
