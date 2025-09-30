@@ -810,6 +810,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is Add:
+            c2 = ch[f[0]]  # Add의 출력 채널은 첫 번째 입력의 채널과 동일
         elif m is Shortcut:
             c2 = ch[f[0]]
         elif m is ReOrg:

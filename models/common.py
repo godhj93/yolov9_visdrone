@@ -542,6 +542,23 @@ class Concat(nn.Module):
         return torch.cat(x, self.d)
 
 
+class Add(nn.Module):
+    # Element-wise addition of a list of tensors
+    def __init__(self, dimension=1):
+        super().__init__()
+        # dimension parameter는 호환성을 위해 받지만 사용하지 않음 (addition은 dimension에 무관)
+        self.d = dimension
+
+    def forward(self, x):
+        # x is a list of tensors - add them element-wise
+        if len(x) == 1:
+            return x[0]
+        result = x[0]
+        for tensor in x[1:]:
+            result = result + tensor
+        return result
+
+
 class Shortcut(nn.Module):
     def __init__(self, dimension=0):
         super(Shortcut, self).__init__()
